@@ -1,86 +1,98 @@
-
-import os
-import time
+import re
+import requests
 import pandas as pd
-from datetime import datetime
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait, Select
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 
-def smart_read_csv_auto_encoding(filepath):
-    encodings = ['utf-8-sig', 'cp950', 'big5']
-    for enc in encodings:
-        try:
-            with open(filepath, 'r', encoding=enc) as f:
-                lines = f.readlines()
-            for idx, line in enumerate(lines):
-                if '證券代號' in line and '證券名稱' in line:
-                    header_idx = idx
-                    df = pd.read_csv(filepath, encoding=enc, skiprows=header_idx)
-                    df = df.loc[~df.iloc[:, 0].astype(str).str.contains("備註|漲跌|當證券|除境外|本統計", na=False)]
-                    df = df.loc[:, ~df.columns.str.contains("Unnamed")]
-                    return df
-        except Exception:
-            continue
-    raise Exception("無法解析 CSV 檔案")
+def fetch_twse_data(date_str: str) -> pd.DataFrame:
+    """
+    Fetch TWSE daily close data (MI_INDEX, type=ALLBUT0999) for a given date.
 
-def fetch_twse_data(date_str):
-    date = datetime.strptime(date_str, "%Y-%m-%d")
-    y, m, d = date.year, date.month, date.day
-    ymd_str = f"{y}{m:02}{d:02}"
+    Args:
+        date_str: "YYYY-MM-DD", e.g. "2025-12-17"
 
-    download_dir = "./data"
-    os.makedirs(download_dir, exist_ok=True)
-    target_filename = f"MI_INDEX_ALLBUT0999_{ymd_str}.csv"
-    target_filepath = os.path.join(download_dir, target_filename)
+    Returns:
+        pd.DataFrame with at least one table that contains '證券代號' column.
+        Adds a 'date' column (YYYY-MM-DD).
+    """
+    # 1) normalize date
+    yyyymmdd = date_str.replace("-", "")
+    if not re.fullmatch(r"\d{8}", yyyymmdd):
+        raise ValueError(f"Invalid date_str: {date_str}. Expect 'YYYY-MM-DD'.")
 
-    if not os.path.exists(target_filepath):
-        url = "https://www.twse.com.tw/zh/page/trading/exchange/MI_INDEX.html"
-        options = Options()
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        prefs = {"download.default_directory": os.path.abspath(download_dir)}
-        options.add_experimental_option("prefs", prefs)
+    url = "https://www.twse.com.tw/exchangeReport/MI_INDEX"
+    params = {
+        "response": "json",
+        "date": yyyymmdd,
+        "type": "ALLBUT0999",  # all but warrants / CBBC etc.
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; twse-scraper/1.0; +https://www.twse.com.tw/)"
+    }
 
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-        driver.get(url)
+    r = requests.get(url, params=params, headers=headers, timeout=30)
+    r.raise_for_status()
+    payload = r.json()
 
-        # 設定年、月、日
-        Select(driver.find_element(By.NAME, "yy")).select_by_value(str(y))
-        Select(driver.find_element(By.NAME, "mm")).select_by_value(str(m))
-        Select(driver.find_element(By.NAME, "dd")).select_by_value(str(d))
+    # 2) basic validation
+    tables = payload.get("tables", [])
+    if not tables:
+        # TWSE sometimes returns empty tables on holidays/non-trading days
+        raise ValueError(f"No tables returned for {date_str}. payload keys={list(payload.keys())}")
 
-                # 選擇分類「全部(不含權證...)」
-        Select(driver.find_element(By.NAME, "type")).select_by_value("ALLBUT0999")
+    # 3) helper: clean stock id like '="020039"' -> '020039'
+    def clean_stock_id(x):
+        if x is None:
+            return None
+        s = str(x).strip()
+        # remove Excel-style ="...."
+        if s.startswith('="') and s.endswith('"'):
+            s = s[2:-1]
+        # keep only digits
+        m = re.search(r"\d+", s)
+        return m.group(0) if m else s
 
-        # 點擊查詢
-        driver.find_element(By.CSS_SELECTOR, "button.search").click()
-
-        # 點擊 CSV 下載按鈕
-        csv_btn = WebDriverWait(driver, 15).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "button.csv"))
-        )
-        csv_btn.click()
-
-        # 等待檔案完成下載
-        for _ in range(30):
-            if os.path.exists(target_filepath) and not os.path.exists(target_filepath + ".crdownload"):
+    # 4) pick the table that looks like "每日收盤行情" and contains "證券代號"
+    chosen = None
+    for t in tables:
+        fields = t.get("fields") or []
+        title = (t.get("title") or "")
+        if ("證券代號" in fields) and (("每日收盤行情" in title) or ("收盤" in title)):
+            chosen = t
+            break
+    if chosen is None:
+        # fallback: first table that contains 證券代號
+        for t in tables:
+            fields = t.get("fields") or []
+            if "證券代號" in fields:
+                chosen = t
                 break
-            time.sleep(1)
-        else:
-            driver.quit()
-            raise Exception("CSV 下載逾時")
-        driver.quit()
 
-    df = smart_read_csv_auto_encoding(target_filepath)
-    df = df.loc[~df.iloc[:, 0].astype(str).str.contains("備註|漲跌|當證券|除境外|本統計", na=False)]
-    df = df.loc[:, ~df.columns.str.contains("Unnamed")]
+    if chosen is None:
+        raise ValueError(f"Cannot find a table with '證券代號' for {date_str}.")
 
-    os.remove(target_filepath)
+    fields = chosen.get("fields") or []
+    data = chosen.get("data") or []
+    if not data:
+        raise ValueError(f"Table found but no data rows for {date_str}. title={chosen.get('title')}")
 
+    df = pd.DataFrame(data, columns=fields)
+
+    # 5) standardize stock id and (optionally) keep only 4-digit stock codes
+    if "證券代號" in df.columns:
+        df["證券代號_raw"] = df["證券代號"]
+        df["證券代號"] = df["證券代號"].map(clean_stock_id)
+
+        # 只保留「代號=四位數」(上市一般股票常用)
+        # df = df[df["證券代號"].astype(str).str.fullmatch(r"\d{4}", na=False)].reset_index(drop=True)
+
+    # 6) add date column
+    df.insert(0, "date", date_str)
+    
+    # 7) remove invalid (without open price) stocks
+    df = df[df["收盤價"] != "--"]
+    
+    df["證券代號"] = df["證券代號"].astype(str)
     return df
+
+# Example:
+# df = fetch_twse_data("2025-12-17")
+# print(df.head())

@@ -16,24 +16,23 @@ def crawl_data(date_str):
 
     # 抓取證交所資料
     twse_fp = f"data/{date_str}_twse.csv"
-    if not os.path.exists(twse_fp):
-    	twse_df = fetch_twse_data(date_str)
-    	save_to_csv(twse_df, twse_fp)
+    # if not os.path.exists(twse_fp):
+    twse_df = fetch_twse_data(date_str)
+    save_to_csv(twse_df, twse_fp)
 
     # 抓取櫃買中心資料
     otc_fp = f"data/{date_str}_otc.csv"
-    if not os.path.exists(otc_fp):
-    	otc_df = fetch_otc_data(date_str)
-    	save_to_csv(otc_df, otc_fp)
-
+    # if not os.path.exists(otc_fp):
+    otc_df = fetch_otc_data(date_str)
+    save_to_csv(otc_df, otc_fp)
     print("資料抓取完成\n")
 
 def merge_data(date_str):
     twse_fp = f"data/{date_str}_twse.csv"
     otc_fp = f"data/{date_str}_otc.csv"
 
-    twse = pd.read_csv(twse_fp)
-    otc = pd.read_csv(otc_fp)
+    twse = pd.read_csv(twse_fp, dtype={"證券代號": str})
+    otc = pd.read_csv(otc_fp, dtype={"代號": str})
 
     print("TWSE 欄位：", twse.columns.tolist())
     print("OTC 原始欄位：", otc.columns.tolist())
@@ -80,6 +79,9 @@ def merge_data(date_str):
 
     merged = merged[['證券代號', '證券名稱', '成交張數', '開盤價', '最高價', '最低價', '收盤價', '當日漲跌幅(%)']]
     print(merged.dtypes)
+    
+    # 清洗資料: 排除成交張數 < 1 的已/準下市櫃股票
+    merged = merged[merged["成交張數"] >= 1]
 
     # 儲存
     output_fp = f"data/{date_str}_merged.csv"
@@ -143,7 +145,8 @@ def filter_data(date_str):
     print(f"已輸出便宜股檔案：{output_fp}")
 
 if __name__ == "__main__":
-    date_str = "2025-05-08"
+    #date_str = "2025-05-08"
+    date_str = "2025-12-17"
     crawl_data(date_str)
     merge_data(date_str)
     filter_data(date_str)

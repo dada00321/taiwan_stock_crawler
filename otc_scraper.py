@@ -1,100 +1,116 @@
-# otc_scraper.py
-import os
+import datetime as dt
 import time
+import requests
 import pandas as pd
-from datetime import datetime
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait, Select
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 
-def smart_read_csv_auto_encoding(filepath):
-    encodings = ['utf-8-sig', 'cp950', 'big5']
-    for enc in encodings:
-        try:
-            with open(filepath, 'r', encoding=enc) as f:
-                lines = f.readlines()
-            for idx, line in enumerate(lines):
-                if '代號' in line and '名稱' in line:
-                    header_idx = idx
-                    df = pd.read_csv(filepath, encoding=enc, skiprows=header_idx)
-                    df = df.loc[~df.iloc[:, 0].astype(str).str.contains("備註|漲跌|當證券|除境外|本統計", na=False)]
-                    df = df.loc[:, ~df.columns.str.contains("Unnamed")]
-                    return df
-        except Exception:
-            continue
-    raise Exception("CSV檔案無法正確解析，請檢查格式")
+def _to_roc_date_str(date_str: str) -> str:
+    d = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+    roc_year = d.year - 1911
+    if roc_year <= 0:
+        raise ValueError(f"Invalid ROC year for date_str={date_str}")
+    return f"{roc_year:03d}/{d.month:02d}/{d.day:02d}"
 
-def fetch_otc_data(date_str):
-    date = datetime.strptime(date_str, "%Y-%m-%d")
-    roc_year = date.year - 1911
-    #ymd = f"{date.year}{date.month:02}{date.day:02}"
+def fetch_otc_data(date_str: str, timeout: int = 20) -> pd.DataFrame:
+    roc_date = _to_roc_date_str(date_str)
 
-    download_dir = "./data"
-    os.makedirs(download_dir, exist_ok=True)
-    target_filename = f"RSTA3104_{roc_year}{date.month:02}{date.day:02}.csv"
-    target_filepath = os.path.join(download_dir, target_filename)
+    url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote_result.php"
+    params = {
+        "l": "zh-tw",
+        "d": roc_date,
+        "_": int(time.time() * 1000),  # cache buster
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/pricing.html",
+        "Accept": "application/json,text/plain,*/*",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    r = requests.get(url, params=params, headers=headers, timeout=timeout)
+    r.raise_for_status()
 
-    if not os.path.exists(target_filepath):
-        url = "https://www.tpex.org.tw/web/stock/aftertrading/daily_close_quotes/stk_quote.php?l=zh-tw"
-        options = Options()
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        prefs = {"download.default_directory": os.path.abspath(download_dir)}
-        options.add_experimental_option("prefs", prefs)
+    try:
+        payload = r.json()
+    except Exception:
+        head = (r.text or "")[:500]
+        raise ValueError(f"Response is not JSON. Head:\n{head}")
 
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-        driver.get(url)
+    # ---- 1) 舊格式：aaData ----
+    if isinstance(payload, dict) and payload.get("aaData"):
+        rows = payload["aaData"]
+        # 沒有 fields 就用常見欄位（依實際長度截斷）
+        default_cols = [
+            "代號","名稱","收盤","漲跌","開盤","最高","最低","均價",
+            "成交股數","成交金額","成交筆數","最後買價","最後買量",
+            "最後賣價","最後賣量","發行股數","次日參考價","次日漲停價","次日跌停價"
+        ]
+        df = pd.DataFrame(rows, columns=default_cols[:len(rows[0])])
+        if "代號" in df.columns:
+            df["代號"] = df["代號"].astype(str).str.zfill(4)
+        return df
 
-        time.sleep(3)
-        # 點開日曆
-        date_input = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[name="date"].date'))
-        )
-        date_input.click()
-        time.sleep(1)
+    # ---- 2) 新格式：tables ----
+    if isinstance(payload, dict) and payload.get("tables"):
+        tables = payload["tables"]
+        if not tables:
+            raise ValueError(f"No tables returned for {date_str} (ROC={roc_date}). stat={payload.get('stat')}")
 
-        # 選擇年份與月份
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "yearselect"))
-        )
-        Select(driver.find_element(By.CLASS_NAME, "yearselect")).select_by_value(str(date.year))
-        Select(driver.find_element(By.CLASS_NAME, "monthselect")).select_by_value(str(date.month - 1))
+        # 多數情況 tables[0] 就是每日收盤行情；但保險起見：找 data 最多的那張
+        best = max(tables, key=lambda t: len(t.get("data") or []))
+        fields = best.get("fields") or []
+        rows = best.get("data") or []
 
-        # 點選對應的日期（不補0）
-        day_cell = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, f"//td[@class='available' and text()='{date.day}']"))
-        )
-        day_cell.click()
+        if not rows:
+            raise ValueError(
+                f"tables present but empty data for {date_str} (ROC={roc_date}). "
+                f"stat={payload.get('stat')}, date={payload.get('date')}"
+            )
 
-        # 點擊 CSV 下載按鈕
-        csv_btn = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, 'button.response[data-format="csv"]'))
-        )
-        csv_btn.click()
+        # fields 若是 dict（有 name/title/key），做一次 normalize
+        if fields and isinstance(fields[0], dict):
+            # 常見 key：'name'/'title'/'field'
+            norm = []
+            for f in fields:
+                norm.append(f.get("name") or f.get("title") or f.get("field") or "")
+            fields = norm
 
-        for _ in range(30):
-            if os.path.exists(target_filepath) and not os.path.exists(target_filepath + ".crdownload"):
-                break
-            time.sleep(1)
+        # 欄位數跟資料長度可能不同，這裡自動截斷/補齊
+        col_n = len(rows[0])
+        if len(fields) >= col_n:
+            cols = fields[:col_n]
         else:
-            driver.quit()
-            raise Exception("CSV 檔案下載失敗")
-        driver.quit()
+            cols = fields + [f"col_{i}" for i in range(len(fields), col_n)]
 
-    df = smart_read_csv_auto_encoding(target_filepath)
-    df['代號'] = df['代號'].astype(str).str.strip()
-    df = df[df['代號'].str.match(r'^\d{4}$')]
-    df['收盤'] = pd.to_numeric(df['收盤'].astype(str).str.replace(',', ''), errors='coerce')
-    df['漲跌'] = pd.to_numeric(df['漲跌'].astype(str).str.replace(',', '').replace('--', '0').str.replace('+', ''), errors='coerce')
-    df['昨收'] = df['收盤'] - df['漲跌']
-    df['漲跌幅(%)'] = (df['漲跌'] / df['昨收'] * 100).round(2)
+        df = pd.DataFrame(rows, columns=cols)
 
-    os.remove(target_filepath)
+        # 代號欄位名稱可能是「代號」或「股票代號」等，做個保守處理
+        code_col = None
+        for c in df.columns:
+            if "代號" in str(c):
+                code_col = c
+                break
+        if code_col:
+            df[code_col] = df[code_col].astype(str).str.zfill(4)
+        
+        # 只篩選四位數的上櫃股票 (不包含上櫃 ETF)
+        # df = df[df["代號"].astype(str).str.fullmatch(r"\d{4}")]
+        
+        # 排除沒有收盤價的標的
+        df = df[df["收盤"] != "---"]
+        
+        df["代號"] = df["代號"].astype(str)
+        
+        return df
 
-    return df#[['代號', '名稱', '收盤', '漲跌', '漲跌幅(%)']]
+    raise ValueError(
+        f"Unrecognized payload format for {date_str} (ROC={roc_date}). "
+        f"payload keys={list(payload.keys()) if isinstance(payload, dict) else type(payload)}"
+    )
+
+'''
+# usage
+if __name__ == "__main__":
+    df = fetch_otc_data("2025-12-17")
+    print(df.head())
+    print("rows:", len(df))
+    print("cols:", list(df.columns))
+'''
