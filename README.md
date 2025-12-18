@@ -1,6 +1,9 @@
 ### 執行方法
 python main.py
 
+### demo
+https://youtu.be/6LN0Lv37Izg
+
 ### 預期輸出檔案（自動建立 data 資料夾）
 1. 2025-12-17_twse.csv（上市股票／ETF／權證）
 2. 2025-12-17_otc.csv（上櫃股票／ETF／權證）
